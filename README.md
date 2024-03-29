@@ -1,3 +1,7 @@
+_This is a fork of https://github.com/xd009642/xd-tts which has been modified
+to use [RTen](https://github.com/robertknight/rten) instead of ONNX Runtime
+for inference_.
+
 # Rustnation 2024 TTS in Rust
 
 This is the project repository for my 2024 Rustnation talk _Creating a
@@ -15,13 +19,6 @@ For the other projects mentioned look no further:
 This repo uses [git-lfs](https://git-lfs.com/) to store the neural networks,
 make sure this is setup before
 cloning or things may not work as expected.
-
-I'm also using the dynamic library feature for ORT. You will need to download
-the correct ORT version for your system
-[here](https://github.com/microsoft/onnxruntime/releases/tag/v1.17.0) 
-and set the `ORT_DYLIB_PATH` env var to the path to `libonnxruntime.so`.
-Alternatively, if the ORT project downloads the correct version for your system
-you can manually remove the feature.
 
 There are two binaries in the project, one to prepare/analyse training data and
 another to run the TTS
