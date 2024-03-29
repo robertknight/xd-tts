@@ -67,10 +67,13 @@ use anyhow::Context;
 use griffin_lim::mel::create_mel_filter_bank;
 use griffin_lim::GriffinLim;
 use ndarray::{concatenate, prelude::*};
-use ort::{inputs, GraphOptimizationLevel, Session, Tensor};
 use std::path::Path;
 use std::str::FromStr;
 use tracing::debug;
+
+use rten::Model;
+use rten_tensor::prelude::*;
+use rten_tensor::TensorView;
 
 // Mel parameters:
 // fmin 0
@@ -138,11 +141,11 @@ fn sigmoid(x: f32) -> f32 {
 /// `export_tacotron2_onnx.py` in <https://github.com/NVIDIA/DeepLearningExamples>
 pub struct Tacotron2 {
     /// Encoder part of the transformer
-    encoder: Session,
+    encoder: Model,
     /// Decoder update part
-    decoder: Session,
+    decoder: Model,
     /// A post network to adjust the outputs
-    postnet: Session,
+    postnet: Model,
     /// IDs of the input tokens
     phoneme_ids: Vec<Unit>,
 }
@@ -233,6 +236,25 @@ impl DecoderState {
     }
 }
 
+/// Create an RTen model input from a model, input name and ndarray view.
+fn make_input<'a, T: 'static, D: Dimension + 'static>(
+    model: &Model,
+    node_name: &str,
+    array: ArrayView<'a, T, D>,
+) -> Result<(rten::NodeId, rten::Input<'a>), anyhow::Error>
+where
+    rten::Input<'a>: From<TensorView<'a, T>>,
+{
+    let node_id = model.node_id(node_name)?;
+    let tensor = TensorView::from_data(array.shape(), array.to_slice().unwrap());
+    Ok((node_id, tensor.into()))
+}
+
+/// Convert an RTen tensor view into an ndarray view.
+fn as_ndarray<T>(x: TensorView<T>) -> ArrayViewD<T> {
+    ArrayViewD::from_shape(x.shape(), x.data().unwrap()).unwrap()
+}
+
 impl Tacotron2 {
     /// Load a tacotron2 model from a folder. This folder should contain 3 files:
     ///
@@ -243,20 +265,16 @@ impl Tacotron2 {
         // Load all the networks. Context is added to the error so we can tell easily which network
         // messes things up
 
-        let encoder = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_model_from_file(path.as_ref().join("encoder.onnx"))
-            .context("converting encoder to runnable model")?;
+        let load_model = |filename, context| {
+            std::fs::read(path.as_ref().join(filename))
+                .map_err(anyhow::Error::new)
+                .and_then(|bytes| Model::load(&bytes).map_err(anyhow::Error::new))
+                .context(context)
+        };
 
-        let decoder = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_model_from_file(path.as_ref().join("decoder_iter.onnx"))
-            .context("converting decoder_iter to runnable model")?;
-
-        let postnet = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_model_from_file(path.as_ref().join("postnet.onnx"))
-            .context("converting postnet to runnable model")?;
+        let encoder = load_model("encoder.rten", "loading encoder model")?;
+        let decoder = load_model("decoder_iter.rten", "loading decoder model")?;
+        let postnet = load_model("postnet.rten", "loading postnet model")?;
 
         Ok(Self {
             encoder,
@@ -279,33 +297,80 @@ impl Tacotron2 {
         let gate_threshold = 0.6;
         let max_decoder_steps = 1000;
 
-        // An example of why setting inputs based on names is much more readable to someone
-        // approaching ML code.
-        let mut inputs = inputs![
-            "decoder_input" => state.decoder_input.view(),
-            "attention_hidden" => state.attention_hidden.view(),
-            "attention_cell" => state.attention_cell.view(),
-            "decoder_hidden" => state.decoder_hidden.view(),
-            "decoder_cell" => state.decoder_cell.view(),
-            "attention_weights" => state.attention_weights.view(),
-            "attention_weights_cum" => state.attention_weights_cum.view(),
-            "attention_context" => state.attention_context.view(),
-            "memory" => memory.view(),
-            "processed_memory" => processed_memory.view(),
-            "mask" => state.mask.view()
-        ]?;
-        // Concat the spectrogram etc
+        // Convert mask from bool to i32 because rten only supports i32 and f32
+        // types.
+        let mask_i32 = state.mask.map(|x| *x as i32);
+
+        // Prepare inputs
+        let mut inputs = [
+            make_input(&self.decoder, "decoder_input", state.decoder_input.view())?,
+            make_input(
+                &self.decoder,
+                "attention_hidden",
+                state.attention_hidden.view(),
+            )?,
+            make_input(&self.decoder, "attention_cell", state.attention_cell.view())?,
+            make_input(&self.decoder, "decoder_hidden", state.decoder_hidden.view())?,
+            make_input(&self.decoder, "decoder_cell", state.decoder_cell.view())?,
+            make_input(
+                &self.decoder,
+                "attention_weights",
+                state.attention_weights.view(),
+            )?,
+            make_input(
+                &self.decoder,
+                "attention_weights_cum",
+                state.attention_weights_cum.view(),
+            )?,
+            make_input(
+                &self.decoder,
+                "attention_context",
+                state.attention_context.view(),
+            )?,
+            make_input(&self.decoder, "memory", memory.view())?,
+            make_input(&self.decoder, "processed_memory", processed_memory.view())?,
+            make_input(&self.decoder, "mask", mask_i32.view())?,
+        ];
 
         let mut mel_spec = Array2::zeros((0, 0));
 
+        // Get output node IDs
+        let gate_prediction_id = self.decoder.node_id("gate_prediction")?;
+        let decoder_output_id = self.decoder.node_id("decoder_output")?;
+        let out_attention_hidden_id = self.decoder.node_id("out_attention_hidden")?;
+        let out_attention_cell_id = self.decoder.node_id("out_attention_cell")?;
+        let out_decoder_hidden_id = self.decoder.node_id("out_decoder_hidden")?;
+        let out_decoder_cell_id = self.decoder.node_id("out_decoder_cell")?;
+        let out_attention_weights_id = self.decoder.node_id("out_attention_weights")?;
+        let out_attention_weights_cum_id = self.decoder.node_id("out_attention_weights_cum")?;
+        let out_attention_context_id = self.decoder.node_id("out_attention_context")?;
+
+        let mut prev_outputs: Vec<rten::Output>;
+
         // Because we always break out of this we could use `loop`.
         for i in 0..max_decoder_steps {
-            // init decoder inputs
-            let mut infer = self.decoder.run(inputs)?;
+            let outputs = [
+                gate_prediction_id,
+                decoder_output_id,
+                out_attention_hidden_id,
+                out_attention_cell_id,
+                out_decoder_hidden_id,
+                out_decoder_cell_id,
+                out_attention_weights_id,
+                out_attention_weights_cum_id,
+                out_attention_context_id,
+            ];
 
-            let gate_prediction = &infer["gate_prediction"].extract_tensor::<f32>()?;
-            let mel_output = &infer["decoder_output"].extract_tensor::<f32>()?;
-            let mel_output = mel_output.view().clone().into_dimensionality()?;
+            prev_outputs = self.decoder.run(&inputs, &outputs, None)?;
+
+            let get_output = |id: usize| {
+                let index = outputs.iter().position(|oid| *oid == id).unwrap();
+                as_ndarray(prev_outputs[index].as_float_ref().unwrap().view())
+            };
+
+            let gate_prediction = get_output(gate_prediction_id);
+            let mel_output = get_output(decoder_output_id);
+            let mel_output = mel_output.into_dimensionality()?;
 
             debug!("Gate: {}", gate_prediction.view()[[0, 0]]);
 
@@ -322,50 +387,45 @@ impl Tacotron2 {
                 debug!("Stopping after {} steps", i);
                 break;
             }
+
             // Prepare the inputs for the next run. We could put this in a condition, but as it's
             // moved on inference it's hard to do this and keep the borrow checker happy. So I
             // moved the condition up to above with the break.
-            inputs = inputs![
-                "memory" => memory.view(),
-                "processed_memory" => processed_memory.view(),
-                "mask" => state.mask.view(),
-            ]?;
-            inputs.insert("decoder_input", infer.remove("decoder_output").unwrap());
-            inputs.insert(
-                "attention_hidden",
-                infer.remove("out_attention_hidden").unwrap(),
-            );
-            inputs.insert(
-                "attention_cell",
-                infer.remove("out_attention_cell").unwrap(),
-            );
-            inputs.insert(
-                "decoder_hidden",
-                infer.remove("out_decoder_hidden").unwrap(),
-            );
-            inputs.insert("decoder_cell", infer.remove("out_decoder_cell").unwrap());
-            inputs.insert(
-                "attention_weights",
-                infer.remove("out_attention_weights").unwrap(),
-            );
-            inputs.insert(
-                "attention_weights_cum",
-                infer.remove("out_attention_weights_cum").unwrap(),
-            );
-            inputs.insert(
-                "attention_context",
-                infer.remove("out_attention_context").unwrap(),
-            );
+            let next_decoder_input = get_output(decoder_output_id);
+            let next_attention_hidden = get_output(out_attention_hidden_id);
+            let next_attention_cell = get_output(out_attention_cell_id);
+            let next_decoder_hidden = get_output(out_decoder_hidden_id);
+            let next_decoder_cell = get_output(out_decoder_cell_id);
+            let next_attention_weights = get_output(out_attention_weights_id);
+            let next_attention_weights_cum = get_output(out_attention_weights_cum_id);
+            let next_attention_context = get_output(out_attention_context_id);
+
+            inputs = [
+                make_input(&self.decoder, "decoder_input", next_decoder_input)?,
+                make_input(&self.decoder, "attention_hidden", next_attention_hidden)?,
+                make_input(&self.decoder, "attention_cell", next_attention_cell)?,
+                make_input(&self.decoder, "decoder_hidden", next_decoder_hidden)?,
+                make_input(&self.decoder, "decoder_cell", next_decoder_cell)?,
+                make_input(&self.decoder, "attention_weights", next_attention_weights)?,
+                make_input(
+                    &self.decoder,
+                    "attention_weights_cum",
+                    next_attention_weights_cum,
+                )?,
+                make_input(&self.decoder, "attention_context", next_attention_context)?,
+                make_input(&self.decoder, "memory", memory.view())?,
+                make_input(&self.decoder, "processed_memory", processed_memory.view())?,
+                make_input(&self.decoder, "mask", mask_i32.view())?,
+            ];
         }
 
         // We have to transpose it and add in a batch dimension for it to be the right shape.
         let mel_spec = mel_spec.t().insert_axis(Axis(0));
+        let mel_spec = mel_spec.as_standard_layout();
 
-        let post = self.postnet.run(inputs![mel_spec.view()]?)?;
-
-        let post = post["mel_outputs_postnet"]
-            .extract_tensor::<f32>()?
-            .view()
+        let mel_spec_tensor = TensorView::from_data(mel_spec.shape(), mel_spec.as_slice().unwrap());
+        let post = self.postnet.run_one(mel_spec_tensor.view().into(), None)?;
+        let post = as_ndarray(post.as_float_ref().unwrap().view())
             .clone()
             .remove_axis(Axis(0))
             .into_dimensionality()?
@@ -389,22 +449,34 @@ impl Tacotron2 {
 
         // Run encoder
         debug!("{:?}", phonemes.len());
-        let plen = arr1(&[phonemes.len() as i64]);
-        let phonemes =
-            Array2::from_shape_vec((1, phonemes.len()), phonemes).context("invalid dimensions")?;
+        let plen = arr1(&[phonemes.len() as i32]);
+        let phonemes_i32: Vec<i32> = phonemes.iter().map(|x| *x as i32).collect();
+        let phonemes = Array2::from_shape_vec((1, phonemes.len()), phonemes_i32)
+            .context("invalid dimensions")?;
 
-        let encoder_outputs = self.encoder.run(inputs![phonemes, plen]?)?;
-        assert_eq!(encoder_outputs.len(), 3);
+        let inputs = [
+            make_input(&self.encoder, "sequences", phonemes.view())?,
+            make_input(&self.encoder, "sequence_lengths", plen.view())?,
+        ];
+        let memory_id = self.encoder.node_id("memory")?;
+        let processed_memory_id = self.encoder.node_id("processed_memory")?;
+
+        let [memory, processed_memory] =
+            self.encoder
+                .run_n(&inputs, [memory_id, processed_memory_id], None)?;
+
+        let memory = as_ndarray(memory.as_float_ref().unwrap().view());
+        let processed_memory = as_ndarray(processed_memory.as_float_ref().unwrap().view());
 
         // The outputs in order are: memory, processed_memory, lens. Despite the name
         // OrtOwnedTensor
-        let memory: Tensor<f32> = encoder_outputs[0].extract_tensor()?;
-        let processed_memory: Tensor<f32> = encoder_outputs[1].extract_tensor()?;
+        // let memory: Tensor<f32> = encoder_outputs[0].extract_tensor()?;
+        // let processed_memory: Tensor<f32> = encoder_outputs[1].extract_tensor()?;
 
         let mut decoder_state = DecoderState::new(&memory.view(), units_len);
 
-        let memory = memory.view().to_owned();
-        let processed_memory = processed_memory.view().to_owned();
+        let memory = memory.to_owned();
+        let processed_memory = processed_memory.to_owned();
 
         self.run_decoder(&memory, &processed_memory, &mut decoder_state)
     }
