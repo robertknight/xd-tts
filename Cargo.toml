@@ -25,5 +25,5 @@ ssml-parser = "0.1.4"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 unicode-segmentation = "1.10.1"
-rten-tensor = { version = "0.7.0" }
-rten = { version = "0.7.0", features = ["random"] }
+rten-tensor = { version = "0.8.0" }
+rten = { version = "0.8.0", features = ["random"] }

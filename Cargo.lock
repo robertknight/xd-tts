@@ -1446,9 +1446,9 @@ dependencies = [
 
 [[package]]
 name = "rten"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91c24b8e959f0aba1893b254621128509689508fbceef5e8fb3f0e36967fa31a"
+checksum = "ed8c84990cfa2d35011d40e0a8f5ad6d1a877dd80f513f04a2a070445cdd82f2"
 dependencies = [
  "fastrand",
  "flatbuffers",
@@ -1456,24 +1456,25 @@ dependencies = [
  "rayon",
  "rten-tensor",
  "rten-vecmath",
+ "rustc-hash",
  "smallvec",
  "wasm-bindgen",
 ]
 
 [[package]]
 name = "rten-tensor"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48e1ec84bc0e1af4afac3eb90538ae484c89478f3f8cbda37ed048453360c5f4"
+checksum = "4d2541dfaf69014c2e730f8386fc9647ddc0c3381b1fe21ce1640f0ed4f74357"
 dependencies = [
  "smallvec",
 ]
 
 [[package]]
 name = "rten-vecmath"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b6ccb4c50101424b77a0d9c93434783df475f2d55107f034ec98ee0885dfcb6"
+checksum = "fc89d64420a5b7a7d74e3b5cc9424029a2ce86906cdaed50491c44e6f1a090f8"
 
 [[package]]
 name = "rustc-hash"
