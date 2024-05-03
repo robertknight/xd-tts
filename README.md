@@ -2,6 +2,15 @@ _This is a fork of https://github.com/xd009642/xd-tts which has been modified
 to use [RTen](https://github.com/robertknight/rten) instead of ONNX Runtime
 for inference_.
 
+_To run this you will need to first use the [`rten-convert`](https://pypi.org/project/rten-convert/) tool on the models in the `models/` directory to generate `.rten`-format models_:
+
+```
+pip install rten-convert
+rten-convert models/tacotron2/encoder.onnx
+rten-convert models/tacotron2/decoder_iter.onnx
+rten-convert models/tacotron2/postnet.onnx
+```
+
 # Rustnation 2024 TTS in Rust
 
 This is the project repository for my 2024 Rustnation talk _Creating a
